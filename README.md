@@ -5,7 +5,8 @@
 推导最优发布候选，规划各副本的 IXFR / AXFR 传输，
 在字节预算内选择要保留的增量集合（支持按故障域公平分配），
 并按时间序列观测对上线做 quorum 门禁判定、
-评估每次发布在各故障域间的传播收敛时延（SLO）。
+评估每次发布在各故障域间的传播收敛时延（SLO）、
+沿时间线检测副本间不存在共同可推进值的分裂窗口。
 
 ## 一条命令启动（Docker Compose）
 
@@ -655,6 +656,113 @@ curl -s http://localhost:8000/propagation-slo \
 （`observation_timestamp_out_of_order`）；副本名重复
 （`duplicate_replica_name`）与空 `failure_domain` 同样返回 422。
 
+### `POST /divergence-windows` — 分裂窗口检测
+
+给定多个副本**按时间排序**的序列号观测（`timestamp` 必填 + `serial`），
+沿时间线重建各副本的最新联合状态，检测连续不存在“能同时严格推进全部副本
+的候选值”的分裂时段。
+
+**时间线语义**：
+
+1. 取全部副本观测时间戳的并集按升序扫掠；
+2. **同一时刻先原子合并全部更新**——该时刻所有副本的观测作为一批同时生效，
+   合并完成后才判定联合状态，同刻更新之间不产生任何中间状态
+   （因此两个副本同刻一起跳到正对点不会误报窗口）；
+3. 某副本在某时刻没有观测时，沿时间线**携带**其最近一次观测值；
+   尚无任何观测的副本不参与当前状态。
+
+**可行候选判定遵循 RFC 1982 环形规则**（与 `/propose` 完全一致）：候选值
+`x` 对联合状态中每个副本当前值 `c` 都必须满足
+`1 ≤ (x − c) mod 2³² ≤ 2³¹−1`，即各副本所允许的开弧
+`{c+1, …, c+2³¹−1}`（模 2³²）之交非空。
+
+> **不能用普通整数极差代替**：`4294967290` 与 `5` 的整数极差约 42.9 亿，
+> 但二者在环上仅相距 11，存在大量共同后继（如 `6`）；反之，`0`、`1073741824`、
+> `3221225471` 三点两两整数极差都不到 2³¹，却没有任何长 2³¹−1 的弧能同时
+> 容纳它们。相差正好 2³¹ 的正对点（`ambiguous`）同样不可行。
+
+**窗口合并与字段**：连续不可行的联合状态合并为一个分裂窗口——
+
+- `start_at`：首个不可行状态的时间戳（该时刻原子合并完成后）；
+- `end_at`：其后**首个可行状态**的时间戳，即半开区间 `[start_at, end_at)`
+  （恰为分裂实际持续的观测时段）；观测结束仍未恢复为 `null`；
+- `duration_seconds`：`end_at - start_at`；未恢复时为 `null`；
+- `replicas`：窗口涉及的副本及**各副本进入窗口时**（窗口开启时刻原子合并
+  后）携带的序列号，按请求中的副本顺序给出；窗口期间才上报观测的副本
+  不补入。
+
+请求（`ns-b` 在 `1030` 跳到 `ns-a=100` 的正对点 `2147483748` 触发分裂，
+`1060` 双方收敛到 101/102 后恢复）：
+
+```bash
+curl -s http://localhost:8000/divergence-windows \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replicas": [
+      {"name": "ns-a", "observations": [
+        {"timestamp": 1000, "serial": 100},
+        {"timestamp": 1030, "serial": 100},
+        {"timestamp": 1060, "serial": 101}
+      ]},
+      {"name": "ns-b", "observations": [
+        {"timestamp": 1000, "serial": 150},
+        {"timestamp": 1030, "serial": 2147483748},
+        {"timestamp": 1060, "serial": 102}
+      ]}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "windows": [
+    {
+      "start_at": 1030,
+      "end_at": 1060,
+      "duration_seconds": 30,
+      "replicas": [
+        {"name": "ns-a", "serial": 100},
+        {"name": "ns-b", "serial": 2147483748}
+      ]
+    }
+  ]
+}
+```
+
+观测结束仍处于分裂时 `end_at` 与 `duration_seconds` 为 `null`。整数极差
+陷阱示例——两副本在回绕点附近（`…290 …295` → `0 …5`）始终可行、不产生
+窗口；随后 `ns-a=2147483648` 与 `ns-b=0` 形成正对点，窗口开启且不再恢复：
+
+```bash
+curl -s http://localhost:8000/divergence-windows \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replicas": [
+      {"name": "ns-a", "observations": [
+        {"timestamp": 0, "serial": 4294967290},
+        {"timestamp": 10, "serial": 0},
+        {"timestamp": 20, "serial": 2147483648}
+      ]},
+      {"name": "ns-b", "observations": [
+        {"timestamp": 0, "serial": 4294967295},
+        {"timestamp": 10, "serial": 5},
+        {"timestamp": 20, "serial": 0}
+      ]}
+    ]
+  }'
+# {"windows":[{"start_at": 20, "end_at": null, "duration_seconds": null,
+#   "replicas": [{"name": "ns-a", "serial": 2147483648},
+#                {"name": "ns-b", "serial": 0}]}]}
+```
+
+输入校验（均为 **422**）：副本名重复（`duplicate_replica_name`）；同一副本
+时间戳倒序（`observation_timestamp_out_of_order`，时间戳要求**非递减**）；
+同一副本同一时间戳出现**不同序列号**（`observation_serial_conflict`，
+同刻同值的重复上报允许并自动去重）；`timestamp` / `serial` 类型或范围非法。
+副本的观测序列允许为空（该副本在首次上报前不参与任何状态）。
+
 ### 输入校验（422）
 
 以下情况返回 **422 Unprocessable Entity**：
@@ -681,6 +789,11 @@ curl -s http://localhost:8000/propagation-slo \
   拒绝）；观测 `timestamp` 必填、非负整数，且同一副本内严格递增——重复
   （`duplicate_observation_timestamp`）或倒序
   （`observation_timestamp_out_of_order`）返回 422。
+- `/divergence-windows` 额外检查：观测 `timestamp` 必填、非负整数，且同一
+  副本内**非递减**——倒序返回 422（`observation_timestamp_out_of_order`）；
+  同一副本在同一时间戳出现**不同序列号**返回 422
+  （`observation_serial_conflict`，同刻同值的重复上报允许）；观测序列允许
+  为空数组。
 
 ## 算法说明
 
@@ -745,6 +858,21 @@ priority 作为常量并入各域基值；对每个可行子集统计各域被�
 停止，之后的回退不再影响结果；窗口结束仍有域未到达则 `converged_at=null`
 并列出升序的 `missing_domains`。各窗口的到达状态相互独立、互不带入。
 
+`/divergence-windows` 中，先把每个副本的观测按 `(timestamp, 副本下标)`
+归并成一条事件时间线（同刻同值的重复观测先去重；倒序与同刻异值在路由层
+即拒绝），再按时间戳分批扫掠：**同一时间戳的全部事件作为一个原子批次**
+更新各副本当前值（保证同刻更新之间不产生中间状态），无更新的副本沿时间
+线携带上一次的值，尚无观测的副本不参与。对每个联合状态复用 `/propose` 的
+`propose_serial` 判定共同开弧交集是否非空——即候选对每个副本值的前向模
+距离都在 `[1, 2³¹−1]`，这是纯环形判定（正对点与跨半环集合不可行，而
+`4294967290` / `5` 这类跨回绕点的紧凑集合可行），与整数极差无关。状态机
+只维护“当前是否处于窗口”：可行转不可行时以**该时刻原子合并后的联合状态
+快照**开窗（快照固定窗口的涉及副本与各副本进入窗口时的序列号，窗口期间
+新上报或迟到的副本不补入）；不可行转可行时以当前时间戳关窗，
+`duration = end − start`；扫掠结束仍开着的窗口 `end_at` /
+`duration_seconds` 为 `null`。连续多个不可行状态因此天然合并为同一窗口，
+不同的不可行时段则各自独立。
+
 ## 测试
 
 核心环形算术不依赖 FastAPI，可直接用标准库运行（另含小位宽空间对暴力穷举的对照测试，
@@ -756,7 +884,10 @@ covered/total 汇总与稳定性测试，以及 `/rollout-gate` 的时间戳排�
 相邻对 RFC 1982 标记、回绕推进、有效推进区间、事件扫掠 quorum 时间窗
 与 422 / OpenAPI 示例测试，以及 `/propagation-slo` 的发布 / 观测时间排序
 校验、窗口边界（左闭右开）、逐域到达与回退失效、同时刻回退优先、
-收敛后回退忽略、缺失域与 deadline 边界测试）：
+收敛后回退忽略、缺失域与 deadline 边界测试，以及 `/divergence-windows`
+的非递减 / 同刻冲突校验、共同严格后继的环形判定（正对点、跨半环、
+回绕整数极差陷阱、三点均匀跨环）、原子合并、值携带、连续不可行合并、
+多窗口切分、进入快照固定、迟到副本与未恢复窗口测试）：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -770,17 +901,18 @@ python3 -m unittest discover -s tests -v
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由与异常（/audit、/propose、/transfer-plan、
 │   │                  #   /retention-plan、/domain-retention-plan、/rollout-gate、
-│   │                  #   /propagation-slo）
-│   ├── schemas.py     # 请求/响应模型与 422 校验（含 /rollout-gate 与
-│   │                  #   /propagation-slo 的 OpenAPI 示例）
-│   └── serial.py      # RFC 1982 环形算术、增量链规划、保留规划、上线门禁
-│                      #   与传播 SLO 评估（纯函数，零第三方依赖）
+│   │                  #   /propagation-slo、/divergence-windows）
+│   ├── schemas.py     # 请求/响应模型与 422 校验（含 /rollout-gate、
+│   │                  #   /propagation-slo 与 /divergence-windows 的 OpenAPI 示例）
+│   └── serial.py      # RFC 1982 环形算术、增量链规划、保留规划、上线门禁、
+│                      #   传播 SLO 评估与分裂窗口检测（纯函数，零第三方依赖）
 ├── tests/test_serial.py
 ├── tests/test_transfer_plan.py
 ├── tests/test_retention_plan.py
 ├── tests/test_domain_retention_plan.py
 ├── tests/test_rollout_gate.py
 ├── tests/test_propagation_slo.py
+├── tests/test_divergence_windows.py
 ├── requirements.txt
 ├── Dockerfile
 ├── compose.yaml

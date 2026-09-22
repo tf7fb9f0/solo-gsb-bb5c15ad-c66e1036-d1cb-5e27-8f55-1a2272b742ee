@@ -9,6 +9,10 @@ from .schemas import (
     AuditItem,
     AuditRequest,
     AuditResponse,
+    DivergenceWindow,
+    DivergenceWindowEntry,
+    DivergenceWindowsRequest,
+    DivergenceWindowsResponse,
     DomainRetentionPlanItem,
     DomainRetentionPlanRequest,
     DomainRetentionPlanResponse,
@@ -38,10 +42,12 @@ from .serial import (
     MAX_RETENTION_REPLICAS,
     build_delta_chain,
     build_sized_delta_chain,
+    check_divergence_observation_order,
     check_observation_time_order,
     check_release_time_order,
     compare_serial,
     DeltaValidationError,
+    evaluate_divergence_windows,
     evaluate_propagation_slo,
     evaluate_rollout_gate,
     forward_distance,
@@ -60,9 +66,10 @@ app = FastAPI(
         "推导对所有副本都严格更新的最佳拟发布值，规划增量 / 全量传输，"
         "在字节预算内选择要保留的增量集合（支持按故障域公平分配），"
         "并按时间序列观测对上线做 quorum 门禁判定、"
-        "评估每次发布在各故障域间的传播收敛时延（SLO）。"
+        "评估每次发布在各故障域间的传播收敛时延（SLO），"
+        "以及沿时间线检测副本间不存在共同可推进值的分裂窗口。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -541,4 +548,70 @@ def propagation_slo(request: PropagationSloRequest) -> PropagationSloResponse:
                 missing_domains,
             ) in outcomes
         ],
+    )
+
+
+@app.post("/divergence-windows", response_model=DivergenceWindowsResponse)
+def divergence_windows(
+    request: DivergenceWindowsRequest,
+) -> DivergenceWindowsResponse:
+    """分裂窗口：沿时间线检测副本间不存在共同可推进值的时段。
+
+    每个副本携带按时间排序的观测序列 ``(timestamp, serial)``。时间戳必须
+    **非递减**——同一副本时间戳倒序返回 422
+    （``observation_timestamp_out_of_order``）；同一副本在同一时间戳上报
+    **不同序列号**同样返回 422（``observation_serial_conflict``，同刻同值的
+    重复上报允许）。
+
+    时间线处理：
+
+    * 取全部观测时间戳的并集按升序扫掠；同一时刻的全部副本更新**先原子
+      合并**，再判定合并后的联合状态（同刻更新之间不产生中间状态）；
+    * 某副本在某时刻无更新时，沿时间线**携带**其最近一次观测值；尚无观测
+      的副本不参与当前状态。
+
+    每个联合状态按 **RFC 1982 环形规则**判定是否存在一个候选值能同时
+    **严格推进**全部副本（候选相对每个副本当前值的前向模距离均在
+    ``[1, 2^31-1]``，即复用 ``/propose`` 的共同开弧交集判定，**不用普通
+    整数极差**：跨 2^32 回绕聚集的值整数极差巨大却可能完全可行）。
+
+    连续不可行的状态合并为一个分裂窗口：``start_at`` 为首个不可行状态的
+    时间戳；``end_at`` 为其后首个可行状态的时间戳（半开区间
+    ``[start_at, end_at)``），观测结束仍未恢复为 null；
+    ``duration_seconds = end_at - start_at``，未恢复为 null。``replicas``
+    给出窗口涉及的副本及各副本进入窗口时（窗口开启时刻原子合并后）携带的
+    序列号。
+    """
+    _check_duplicate_names([r.name for r in request.replicas])
+
+    try:
+        for replica in request.replicas:
+            check_divergence_observation_order(
+                replica.name,
+                [(o.timestamp, o.serial) for o in replica.observations],
+            )
+    except ObservationOrderError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+    outcomes = evaluate_divergence_windows(
+        [r.name for r in request.replicas],
+        [
+            [(o.timestamp, o.serial) for o in replica.observations]
+            for replica in request.replicas
+        ],
+    )
+
+    return DivergenceWindowsResponse(
+        windows=[
+            DivergenceWindow(
+                start_at=start_at,
+                end_at=end_at,
+                duration_seconds=duration_seconds,
+                replicas=[
+                    DivergenceWindowEntry(name=name, serial=serial)
+                    for name, serial in entries
+                ],
+            )
+            for start_at, end_at, duration_seconds, entries in outcomes
+        ]
     )

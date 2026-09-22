@@ -1016,3 +1016,164 @@ def evaluate_propagation_slo(
             )
         )
     return results
+
+
+# ---------------------------------------------------------------------------
+# 分裂窗口（POST /divergence-windows）
+# ---------------------------------------------------------------------------
+
+OBSERVATION_SERIAL_CONFLICT = "observation_serial_conflict"
+"""同一副本在同一时间戳上报了不同的序列号。"""
+
+
+def check_divergence_observation_order(
+    name: str, observations: List[Tuple[int, int]]
+) -> None:
+    """校验单个副本的观测时间戳非递减；同刻序列号必须一致。
+
+    与 :func:`check_observation_time_order` 不同，这里允许同一时间戳出现多条
+    观测（同一时刻的多个副本更新需要先原子合并），因此时间戳要求是**非递减**
+    而非严格递增：
+
+    * 时间戳小于前一条（倒序）抛出 error=observation_timestamp_out_of_order；
+    * 时间戳相同但序列号不同（同刻冲突）抛出
+      error=observation_serial_conflict；
+    * 时间戳相同且序列号相同视为重复上报，静默保留。
+
+    两者均为 :class:`ObservationOrderError`，由路由层转为 422。
+    """
+    prev_ts: Optional[int] = None
+    prev_serial: Optional[int] = None
+    prev_index = -1
+    for index, (ts, serial) in enumerate(observations):
+        if prev_ts is not None:
+            if ts < prev_ts:
+                raise ObservationOrderError(
+                    {
+                        "error": "observation_timestamp_out_of_order",
+                        "message": (
+                            f"副本 {name} 的观测时间戳必须非递减："
+                            f"下标 {prev_index} 为 {prev_ts}，下标 {index} 为 {ts}"
+                        ),
+                        "replica": name,
+                        "index": index,
+                        "timestamp": ts,
+                        "previous_timestamp": prev_ts,
+                    }
+                )
+            if ts == prev_ts and serial != prev_serial:
+                raise ObservationOrderError(
+                    {
+                        "error": OBSERVATION_SERIAL_CONFLICT,
+                        "message": (
+                            f"副本 {name} 在同一时间戳 {ts} 上报了不同的序列号："
+                            f"{prev_serial} 与 {serial}（下标 {prev_index} 与 {index}）"
+                        ),
+                        "replica": name,
+                        "index": index,
+                        "timestamp": ts,
+                        "serials": [prev_serial, serial],
+                    }
+                )
+        prev_ts = ts
+        prev_serial = serial
+        prev_index = index
+
+
+def has_common_strict_successor(values: List[int]) -> bool:
+    """是否存在一个候选值能按 RFC 1982 **同时严格推进**全部当前值。
+
+    复用 :func:`propose_serial`：可行候选必须对每个值的前向模距离都落在
+    ``[1, 2^31 - 1]``（开弧 ``{v+1, …, v+2^31-1}`` 之交非空）。环上跨度达到
+    半环（含相差正好 2^31 的正对点）时无任何可行候选——此处**不能**用普通
+    整数极差 ``max - min`` 判断：极差很大的值可能因跨 2^32 回绕而集中在环上
+    同一段（如 ``4294967290`` 与 ``5``，整数极差约 4.29e9 却完全可行）。
+
+    0 个或 1 个值时恒有可行候选（单值总能取 ``(v + 1) mod 2^32``）。
+    """
+    if len(values) <= 1:
+        return True
+    return propose_serial(values) is not None
+
+
+def evaluate_divergence_windows(
+    names: List[str],
+    replica_observations: List[List[Tuple[int, int]]],
+) -> List[Tuple[int, Optional[int], Optional[int], List[Tuple[str, int]]]]:
+    """沿时间线合并多副本观测，提取连续无可行候选的分裂窗口。
+
+    *names* 与 *replica_observations* 同序，后者每项为该副本的
+    ``(timestamp, serial)`` 观测序列（时间戳非递减、同刻序列号一致，由
+    :func:`check_divergence_observation_order` 事先校验）。
+
+    时间线处理规则：
+
+    1. 取全部观测时间戳的并集按升序扫掠；
+    2. 同一时刻先**原子合并**该时刻的全部副本更新（任一副本同刻的序列号
+       冲突已在校验阶段拒绝），再判定合并后的联合状态——同刻更新之间不产生
+       任何中间状态，不会把窗口边界切在同一时刻内；
+    3. 每个副本若无更新则沿时间线**携带**其最近一次观测值；尚无任何观测的
+       副本不参与当前状态。
+
+    对每个联合状态调用 :func:`has_common_strict_successor` 判定是否存在一个
+    能同时严格推进全部已知副本值的候选（RFC 1982 环形规则）。连续不可行的
+    状态合并为一个分裂窗口：
+
+    * ``start_at`` = 首个不可行状态的时间戳（即该时刻原子合并完成后）；
+    * ``end_at`` = 其后首个可行状态的时间戳（半开区间
+      ``[start_at, end_at)``，恰为分裂实际持续的观测时段）；观测结束仍未
+      恢复时为 None；
+    * ``duration_seconds`` = ``end_at - start_at``；未恢复为 None；
+    * ``entries`` = 窗口**开启时刻**参与该不可行状态的副本及其当时携带的
+       序列号（即各副本进入窗口时的序列号，按副本输入顺序）。窗口期间新
+       上报观测的副本不补入 entries。
+
+    返回按 ``start_at`` 升序的窗口列表，每项为
+    ``(start_at, end_at, duration_seconds, entries)``。
+    """
+    # 每副本观测按时间戳去重（同刻同序列号的重复上报只保留一条），
+    # 再以 (timestamp, 副本下标) 归并为时间线：同刻事件天然聚在一起。
+    events: List[Tuple[int, int, int]] = []
+    for replica_index, observations in enumerate(replica_observations):
+        last_ts: Optional[int] = None
+        for ts, serial in observations:
+            if ts == last_ts:
+                continue
+            events.append((ts, replica_index, serial))
+            last_ts = ts
+    events.sort()
+
+    current: List[Optional[int]] = [None] * len(names)
+    windows: List[Tuple[int, Optional[int], Optional[int], List[Tuple[str, int]]]] = []
+    open_start: Optional[int] = None
+    open_entries: List[Tuple[str, int]] = []
+
+    index = 0
+    while index < len(events):
+        ts = events[index][0]
+        # 同一时刻：原子合并全部更新后再判定
+        while index < len(events) and events[index][0] == ts:
+            _t, replica_index, serial = events[index]
+            current[replica_index] = serial
+            index += 1
+
+        known = [value for value in current if value is not None]
+        feasible = has_common_strict_successor(known)
+
+        if not feasible and open_start is None:
+            open_start = ts
+            open_entries = [
+                (name, value)
+                for name, value in zip(names, current)
+                if value is not None
+            ]
+        elif feasible and open_start is not None:
+            windows.append(
+                (open_start, ts, ts - open_start, open_entries)
+            )
+            open_start = None
+            open_entries = []
+
+    if open_start is not None:
+        windows.append((open_start, None, None, open_entries))
+    return windows

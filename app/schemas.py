@@ -832,3 +832,153 @@ class PropagationSloResponse(BaseModel):
 
     deadline_seconds: int
     releases: List[PropagationReleaseItem]
+
+
+# ---------------------------------------------------------------------------
+# POST /divergence-windows
+# ---------------------------------------------------------------------------
+
+
+class DivergenceObservation(BaseModel):
+    """一条副本观测：时间戳（必填）+ 观测到的 SOA 序列号。"""
+
+    timestamp: int = Field(
+        ...,
+        description=(
+            "观测时间戳（Unix 秒，非负整数）；同一副本内必须非递减，"
+            "允许同一时间戳多条观测但序列号必须一致"
+        ),
+    )
+    serial: int = Field(..., description="观测到的 32 位无符号 SOA 序列号")
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _timestamp_non_negative(cls, value: object) -> int:
+        return _coerce_non_negative_int(value, "观测时间戳")
+
+    @field_validator("serial", mode="before")
+    @classmethod
+    def _serial_serial32(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+
+class DivergenceReplica(BaseModel):
+    """单个副本：名称 + 按时间非递减排序的观测序列。"""
+
+    name: str = Field(..., min_length=1, description="副本名称（不可重复）")
+    observations: List[DivergenceObservation] = Field(
+        ...,
+        description=(
+            "按时间排序的观测序列（可为空）；时间戳必须非递减，"
+            "倒序返回 422（observation_timestamp_out_of_order），"
+            "同一副本同一时间戳出现不同序列号返回 422"
+            "（observation_serial_conflict）"
+        ),
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("副本名称不能为空")
+        return value
+
+
+class DivergenceWindowsRequest(BaseModel):
+    """POST /divergence-windows 请求体。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "replicas": [
+                        {
+                            "name": "ns-a",
+                            "observations": [
+                                {"timestamp": 1000, "serial": 100},
+                                {"timestamp": 1030, "serial": 100},
+                                {"timestamp": 1060, "serial": 101},
+                            ],
+                        },
+                        {
+                            "name": "ns-b",
+                            "observations": [
+                                {"timestamp": 1000, "serial": 150},
+                                {"timestamp": 1030, "serial": 2147483798},
+                                {"timestamp": 1060, "serial": 102},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "replicas": [
+                        {
+                            "name": "ns-a",
+                            "observations": [
+                                {"timestamp": 0, "serial": 4294967290},
+                                {"timestamp": 10, "serial": 0},
+                                {"timestamp": 20, "serial": 2147483648},
+                            ],
+                        },
+                        {
+                            "name": "ns-b",
+                            "observations": [
+                                {"timestamp": 0, "serial": 4294967295},
+                                {"timestamp": 10, "serial": 5},
+                                {"timestamp": 20, "serial": 0},
+                            ],
+                        },
+                    ],
+                },
+            ]
+        }
+    )
+
+    replicas: List[DivergenceReplica] = Field(..., min_length=1)
+
+
+class DivergenceWindowEntry(BaseModel):
+    """副本进入分裂窗口时的状态（顺序与请求中的副本一致）。"""
+
+    name: str = Field(..., description="副本名称")
+    serial: int = Field(
+        ..., description="该副本进入窗口（窗口开启时刻原子合并后）携带的序列号",
+    )
+
+
+class DivergenceWindow(BaseModel):
+    """一个连续无可行候选的分裂窗口。"""
+
+    start_at: int = Field(
+        ...,
+        description=(
+            "窗口起点（Unix 秒）：该时刻全部更新原子合并后首次不存在能同时"
+            "严格推进所有副本的候选值"
+        ),
+    )
+    end_at: Optional[int] = Field(
+        ...,
+        description=(
+            "窗口终点（Unix 秒）：起点之后首个恢复可行候选的状态时间戳"
+            "（半开区间 [start_at, end_at)）；观测结束仍未恢复为 null"
+        ),
+    )
+    duration_seconds: Optional[int] = Field(
+        ...,
+        description="end_at - start_at（秒）；尚未恢复（end_at 为 null）时为 null",
+    )
+    replicas: List[DivergenceWindowEntry] = Field(
+        ...,
+        description=(
+            "窗口涉及的副本及其进入窗口时的序列号（窗口开启时刻的联合状态，"
+            "按请求中的副本顺序）"
+        ),
+    )
+
+
+class DivergenceWindowsResponse(BaseModel):
+    """POST /divergence-windows 响应体。"""
+
+    windows: List[DivergenceWindow] = Field(
+        ..., description="分裂窗口列表，按 start_at 升序；无分裂时为空数组",
+    )
