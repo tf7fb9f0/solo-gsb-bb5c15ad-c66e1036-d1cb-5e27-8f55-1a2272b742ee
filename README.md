@@ -5,7 +5,8 @@
 推导最优发布候选，规划各副本的 IXFR / AXFR 传输，
 在字节预算内选择要保留的增量集合（支持按故障域公平分配），
 并按时间序列观测对上线做 quorum 门禁判定、
-评估每次发布在各故障域间的传播收敛时延（SLO）。
+评估每次发布在各故障域间的传播收敛时延（SLO），
+以及沿时间线检测各副本序列号无可共同推进候选的分裂窗口。
 
 ## 一条命令启动（Docker Compose）
 
@@ -655,13 +656,141 @@ curl -s http://localhost:8000/propagation-slo \
 （`observation_timestamp_out_of_order`）；副本名重复
 （`duplicate_replica_name`）与空 `failure_domain` 同样返回 422。
 
+### `POST /divergence-windows` — 分裂窗口检测
+
+给定多个副本**按时间排序**的序列号观测（每个副本携带 `observations`：
+必填非负的 `timestamp` + `serial`，列表允许为空），沿时间线检测各副本
+序列号**不存在任何能同时严格推进全部副本的候选值**的连续区间：
+
+- 全部观测汇成事件按时间排序；每个时间戳**先原子合并该时刻的全部更新**
+  （同一时刻任意多个副本的观测一起生效，不存在“先看到谁”的中间状态），
+  再沿时间线**携带各副本最近一次观测值**——尚无观测的副本不参与该时刻的判定。
+- 每个合并后状态按 **RFC 1982 环形规则**判定：存在候选 `x` 使每个副本的
+  最新值 `c_i` 都满足 `1 ≤ (x − c_i) mod 2³² ≤ 2³¹ − 1`（即各开弧
+  `{c+1, …, c+2³¹−1} mod 2³²` 的交集非空）才算可行。
+  **不能用普通整数极差代替**：`4294967290` 与 `10` 的整数极差接近 2³²，
+  前向距离却只有 16，存在共同后继；而 `0` 与 `2³¹−1` 的整数极差不足 2³¹，
+  开弧交集却已为空（再如相差正好 2³¹ 的正对点恒不可比较）。
+- **连续**无可行候选的状态合并为一个**分裂窗口**：中间任一状态恢复可行即闭窗，
+  之后再次发散另开新窗。`start_at` 为首个无候选状态的时间；`end_at` 为其后
+  首个恢复可行状态的时间，`duration_seconds = end_at − start_at`；
+  观测结束仍未恢复时 `end_at` 与 `duration_seconds` 均为 `null`。
+- 每个窗口返回涉及副本 `replicas` 及各副本**进入窗口时**的序列号 `entries`：
+  窗口开启时对全部已知副本快照；窗口开启后才首次出现的副本在其窗口内首个
+  观测时间戳加入，取该首条观测序列号（按请求中的副本顺序输出）。
+
+同一副本的观测时间戳允许**同刻多条**（同一时刻原子合并），但必须非递减：
+倒序返回 422（`observation_timestamp_out_of_order`）；同一副本同一时间戳
+出现**不同序列号**返回 422（`observation_serial_conflict`）；
+同刻同值的重复观测合法并自动去重。副本名重复（`duplicate_replica_name`）
+同样返回 422。
+
+请求（`t=20` 时 `ns-b` 推进到 `ns-a=100` 的正对点 `100+2³¹=2147483748`，
+任何单一候选都无法同时严格推进两者，窗口开启；`t=50` 两者汇聚到 200，
+恢复可行，窗口关闭）：
+
+```bash
+curl -s http://localhost:8000/divergence-windows \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replicas": [
+      {"name": "ns-a", "observations": [
+        {"timestamp": 0,  "serial": 100},
+        {"timestamp": 20, "serial": 100},
+        {"timestamp": 50, "serial": 200}
+      ]},
+      {"name": "ns-b", "observations": [
+        {"timestamp": 10, "serial": 100},
+        {"timestamp": 20, "serial": 2147483748},
+        {"timestamp": 40, "serial": 2147483748},
+        {"timestamp": 50, "serial": 200}
+      ]}
+    ]
+  }'
+```
+
+响应（`entries` 为两副本**进入窗口时**持有的序列号：`ns-a=100`、
+`ns-b=2147483748`；窗口持续 30 秒）：
+
+```json
+{
+  "windows": [
+    {
+      "start_at": 20,
+      "end_at": 50,
+      "duration_seconds": 30,
+      "replicas": ["ns-a", "ns-b"],
+      "entries": [
+        {"name": "ns-a", "serial": 100},
+        {"name": "ns-b", "serial": 2147483748}
+      ]
+    }
+  ]
+}
+```
+
+整数极差会误判、必须按环形前向距离判定的两个对照：
+
+```bash
+# 4294967290 与 10：整数极差近 2^32，但前向距离仅 16，始终可行 -> 无窗口
+curl -s http://localhost:8000/divergence-windows \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replicas": [
+      {"name": "ns-a", "observations": [
+        {"timestamp": 0, "serial": 4294967290},
+        {"timestamp": 10, "serial": 4294967290}
+      ]},
+      {"name": "ns-b", "observations": [
+        {"timestamp": 0, "serial": 10},
+        {"timestamp": 10, "serial": 0}
+      ]}
+    ]
+  }'
+# {"windows": []}
+
+# 0 与 2147483647（2^31-1）：整数极差不足 2^31 却已无共同候选
+curl -s http://localhost:8000/divergence-windows \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replicas": [
+      {"name": "ns-a", "observations": [{"timestamp": 0, "serial": 0}]},
+      {"name": "ns-b", "observations": [{"timestamp": 5, "serial": 2147483647}]}
+    ]
+  }'
+# 窗口开启后观测结束仍未恢复：
+# {"windows": [{"start_at": 5, "end_at": null, "duration_seconds": null,
+#   "replicas": ["ns-a", "ns-b"],
+#   "entries": [{"name": "ns-a", "serial": 0},
+#               {"name": "ns-b", "serial": 2147483647}]}]}
+```
+
+同一时刻的更新**原子合并**：两个副本在 `t=10` 一起更新到相同值，
+即使其中任一副本的新值相对另一副本的旧值是正对点，也不会产生瞬时窗口。
+同一副本同刻给出不同序列号则为 422：
+
+```bash
+curl -s http://localhost:8000/divergence-windows \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replicas": [
+      {"name": "ns-a", "observations": [
+        {"timestamp": 10, "serial": 100},
+        {"timestamp": 10, "serial": 101}
+      ]}
+    ]
+  }'
+# 422 {"detail": {"error": "observation_serial_conflict", ...}}
+```
+
 ### 输入校验（422）
 
 以下情况返回 **422 Unprocessable Entity**：
 
 - 序列号越界：必须为整数且在 `[0, 4294967295]`（即 `[0, 2^32-1]`）；
 - 副本名重复（`/audit`、`/propose`、`/transfer-plan`、`/retention-plan`、
-  `/domain-retention-plan` 均检查）；
+  `/domain-retention-plan`、`/rollout-gate`、`/propagation-slo`、
+  `/divergence-windows` 均检查）；
 - 副本名为空 / `replicas` 为空数组；
 - `/transfer-plan` 额外检查：增量非严格 newer（`delta_not_strictly_newer`）、
   同一 `from_serial` 分叉（`delta_fork`）；
@@ -681,6 +810,12 @@ curl -s http://localhost:8000/propagation-slo \
   拒绝）；观测 `timestamp` 必填、非负整数，且同一副本内严格递增——重复
   （`duplicate_observation_timestamp`）或倒序
   （`observation_timestamp_out_of_order`）返回 422。
+- `/divergence-windows` 额外检查：观测 `serial` 必须是合法序列号，
+  `timestamp` 必填且为非负整数；同一副本的观测时间戳必须**非递减**
+  （允许同刻多条），倒序返回 422（`observation_timestamp_out_of_order`）；
+  同一副本同一时间戳出现不同序列号返回 422
+  （`observation_serial_conflict`，同刻同值的重复观测合法并去重）；
+  副本名重复（`duplicate_replica_name`）同样返回 422。
 
 ## 算法说明
 
@@ -745,6 +880,20 @@ priority 作为常量并入各域基值；对每个可行子集统计各域被�
 停止，之后的回退不再影响结果；窗口结束仍有域未到达则 `converged_at=null`
 并列出升序的 `missing_domains`。各窗口的到达状态相互独立、互不带入。
 
+`/divergence-windows` 中，各副本观测先经
+`check_divergence_observation_order` 校验（时间戳非递减；同刻同副本的序列号
+必须一致，同刻同值重复允许），再汇成 `(时间戳, 副本下标, 序列号)` 事件按序
+扫掠：同一时间戳的全部更新**先原子合并**到各副本最新值表，再对合并后的
+整体状态调用 `has_common_successor`——它复用 `/propose` 的
+`propose_serial`，仅判断各副本开弧 `{c+1, …, c+2³¹−1}`（模 2³²）的交集
+是否非空，因此严格遵循 RFC 1982 环形规则而非整数极差（正对点、跨度达
+2³¹−1 的非回绕状态均无候选；回绕点附近整数极差近 2³² 的状态反而可行）。
+尚无观测的副本不在最新值表中、不参与判定。连续的不可行状态合并为窗口：
+开窗时对当前全部已知副本的最新值快照为 `entries`；窗口内新出现的副本在其
+首个观测时刻（合并后仍不可行）以首条观测序列号补入；遇到首个可行状态即
+闭窗，`end_at` 取该状态时间、`duration_seconds = end_at − start_at`；
+扫掠结束窗口仍开启则 `end_at` / `duration_seconds` 为 null。
+
 ## 测试
 
 核心环形算术不依赖 FastAPI，可直接用标准库运行（另含小位宽空间对暴力穷举的对照测试，
@@ -756,7 +905,10 @@ covered/total 汇总与稳定性测试，以及 `/rollout-gate` 的时间戳排�
 相邻对 RFC 1982 标记、回绕推进、有效推进区间、事件扫掠 quorum 时间窗
 与 422 / OpenAPI 示例测试，以及 `/propagation-slo` 的发布 / 观测时间排序
 校验、窗口边界（左闭右开）、逐域到达与回退失效、同时刻回退优先、
-收敛后回退忽略、缺失域与 deadline 边界测试）：
+收敛后回退忽略、缺失域与 deadline 边界测试，以及 `/divergence-windows`
+的时间戳非递减 / 同刻序列号冲突校验、同刻原子合并、RFC 1982 共同后继
+判定（整数极差对照）、连续状态合并 / 恢复分窗、未恢复窗口 null 字段、
+迟到副本进入窗口 entries 与 422 路由测试）：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -770,17 +922,18 @@ python3 -m unittest discover -s tests -v
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由与异常（/audit、/propose、/transfer-plan、
 │   │                  #   /retention-plan、/domain-retention-plan、/rollout-gate、
-│   │                  #   /propagation-slo）
-│   ├── schemas.py     # 请求/响应模型与 422 校验（含 /rollout-gate 与
-│   │                  #   /propagation-slo 的 OpenAPI 示例）
+│   │                  #   /propagation-slo、/divergence-windows）
+│   ├── schemas.py     # 请求/响应模型与 422 校验（含 /rollout-gate、
+│   │                  #   /propagation-slo 与 /divergence-windows 的 OpenAPI 示例）
 │   └── serial.py      # RFC 1982 环形算术、增量链规划、保留规划、上线门禁
-│                      #   与传播 SLO 评估（纯函数，零第三方依赖）
+│                      #   与传播 SLO 评估、分裂窗口扫掠（纯函数，零第三方依赖）
 ├── tests/test_serial.py
 ├── tests/test_transfer_plan.py
 ├── tests/test_retention_plan.py
 ├── tests/test_domain_retention_plan.py
 ├── tests/test_rollout_gate.py
 ├── tests/test_propagation_slo.py
+├── tests/test_divergence_windows.py
 ├── requirements.txt
 ├── Dockerfile
 ├── compose.yaml
